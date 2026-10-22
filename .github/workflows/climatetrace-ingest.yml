@@ -7,10 +7,15 @@ on:
 
 permissions:
   contents: read
+  id-token: write          # required for OIDC login to Azure
 
 concurrency:
   group: climatetrace-ingest
   cancel-in-progress: false
+
+env:
+  STORAGE_ACCOUNT: databrickssetup
+  STORAGE_RG: DefaultResourceGroup-CCAN
 
 jobs:
   ingest:
@@ -27,7 +32,47 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Azure login (OIDC, no stored secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # The storage account firewall denies by default; GitHub-hosted runners
+      # have random egress IPs, so allow this run's IP and remove it afterwards.
+      - name: Allow runner IP through storage firewall
+        id: fw
+        env:
+          CONN: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
+        run: |
+          set -euo pipefail
+          IP=$(curl -fsS https://api.ipify.org)
+          echo "runner_ip=$IP" >> "$GITHUB_OUTPUT"
+          az storage account network-rule add \
+            --account-name "$STORAGE_ACCOUNT" \
+            --resource-group "$STORAGE_RG" \
+            --ip-address "$IP" -o none
+          for i in $(seq 1 18); do
+            if az storage container show --name landing \
+                 --connection-string "$CONN" -o none 2>/dev/null; then
+              echo "storage reachable after $((i * 10))s"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "storage still unreachable after 180s" >&2
+          exit 1
+
       - name: Run ingestion
-        run: python ingest.py
         env:
           AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
+        run: python ingest.py
+
+      - name: Remove runner IP from storage firewall
+        if: always() && steps.fw.outputs.runner_ip != ''
+        run: |
+          az storage account network-rule remove \
+            --account-name "$STORAGE_ACCOUNT" \
+            --resource-group "$STORAGE_RG" \
+            --ip-address "${{ steps.fw.outputs.runner_ip }}" -o none
