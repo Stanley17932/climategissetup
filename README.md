@@ -9,6 +9,10 @@ raw JSON in Azure Blob Storage for downstream (Databricks) processing.
 on manual dispatch). For each configured source it pulls the current year and the
 previous year, validates the response, and uploads it.
 
+It then runs `warehouse.py`, which loads the landed JSON into the free Azure SQL
+database and exports it to Parquet for Databricks — see
+[Warehouse](#warehouse-azure-sql--parquet).
+
 Data source: `https://api.climatetrace.org/v7/sources` (API v7), `gas=co2`.
 
 | label | filter | why |
@@ -79,6 +83,61 @@ Both guards fail the job (and skip the upload) rather than silently landing bad 
 A failing source does not stop the others; all pulls are attempted, then the job
 exits non-zero with a summary.
 
+## Warehouse (Azure SQL -> Parquet)
+
+`warehouse.py` is the landing -> warehouse -> curated half of the pipeline:
+
+```
+python warehouse.py load     # newest blob per (source, year) -> dbo.climatetrace_sources
+python warehouse.py export   # table -> parquet in the `curated` container
+```
+
+`load` is idempotent per `(year, gas)`: the year's rows are deleted and re-inserted
+inside one transaction, so a re-run replaces rather than appends. The primary key is
+`(id, year, gas)`; the API occasionally returns the same asset twice across a page
+boundary, and those duplicates are collapsed (33,104 pulled -> 33,102 stored).
+
+Two constraints shaped the write path, and both are worth knowing before "optimising" it:
+
+- **`executemany` is not viable.** pyodbc sends a round trip per row; against this
+  serverless database that measured ~108 ms/row, i.e. ~30 minutes per year. A
+  parameterised multi-row `VALUES` list is no better - 21 columns means SQL Server's
+  2,100-parameter ceiling caps it at 99 rows a statement, which is still 167 round
+  trips per year.
+- **One `OPENJSON` statement per chunk, 5,000 rows.** A single JSON parameter, shredded
+  server-side. The cost is then just bytes on the wire, not round trips.
+
+Measured on this database: 16,551 rows took 86 s, of which the clustered-index
+build was 0.8 s. Nearly all of that was a slow client uplink (~75 KB/s); from a
+GitHub runner the same load is seconds.
+
+`export` writes one Parquet file per year to
+`curated/climatetrace_sources/year=<year>/sources.parquet`, because Databricks Free
+Edition compute **cannot** reach `*.database.windows.net` over the internet - its
+serverless compute is restricted to a set of trusted domains, and Free Edition has no
+egress settings to change. Parquet in blob storage is the bridge.
+
+### SQL access
+
+The same OIDC principal used for storage is a **contained database user** in
+`free-sql-db-9295428`, added with no server-level login:
+
+| grant | why |
+|---|---|
+| `db_datareader`, `db_datawriter` | `SELECT` for the export, `DELETE`/`INSERT` for the load |
+| `CREATE TABLE` | `load` creates `dbo.climatetrace_sources` on first run |
+| `ALTER ON SCHEMA::dbo` | lets `load` evolve that table |
+
+There is no SQL password anywhere. `sql_connection()` takes an Entra token via
+`DefaultAzureCredential` (the Azure CLI credential that `azure/login` seeds in CI),
+and retries on the `40613`/`233` family because the free database is serverless and
+**auto-pauses when idle** - the first connection of every daily run lands while it is
+resuming.
+
+The SQL server firewall denies by default too, so the workflow adds a
+`github-actions-<ip>` rule alongside the storage rule and removes it afterwards.
+Locally, your own IP needs a rule on both (and on the storage account).
+
 ## Running locally
 
 ```bash
@@ -86,6 +145,11 @@ pip install -r requirements.txt
 az login                      # DefaultAzureCredential picks this up
 export AZURE_STORAGE_ACCOUNT_URL=https://databrickssetup.blob.core.windows.net
 python ingest.py
+
+export AZURE_SQL_SERVER=stan-devsql.database.windows.net
+export AZURE_SQL_DATABASE=free-sql-db-9295428
+python warehouse.py load      # needs ODBC Driver 18 installed locally too
+python warehouse.py export
 ```
 
 Your IP must be allowed through the storage firewall, otherwise you get
@@ -108,7 +172,8 @@ data = ingest.fetch_climatetrace(ingest.SOURCES[0], 2025)
 ## Repository layout
 
 ```
-ingest.py                                  # the whole pipeline
+ingest.py                                  # pull -> landing blobs
+warehouse.py                               # landing -> Azure SQL -> curated Parquet
 requirements.txt
 .github/workflows/climatetrace-ingest.yml  # schedule + OIDC + firewall handling
 ```
