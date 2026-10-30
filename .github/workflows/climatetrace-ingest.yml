@@ -16,6 +16,8 @@ concurrency:
 env:
   STORAGE_ACCOUNT: databrickssetup
   STORAGE_RG: DefaultResourceGroup-CCAN
+  SQL_SERVER: stan-devsql
+  SQL_DATABASE: free-sql-db-9295428
 
 jobs:
   ingest:
@@ -32,6 +34,20 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # warehouse.py talks to Azure SQL through pyodbc, which needs the driver
+      # itself - it is a Microsoft apt package, not a pip one.
+      - name: Install ODBC Driver 18 for SQL Server
+        run: |
+          set -euo pipefail
+          OS_VER=$(. /etc/os-release && echo "$VERSION_ID")
+          curl -sSL https://packages.microsoft.com/keys/microsoft.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+          curl -sSL "https://packages.microsoft.com/config/ubuntu/${OS_VER}/prod.list" \
+            | sudo tee /etc/apt/sources.list.d/mssql-release.list >/dev/null
+          sudo apt-get update -qq
+          sudo ACCEPT_EULA=Y apt-get install -y -qq msodbcsql18
+          odbcinst -q -d -n "ODBC Driver 18 for SQL Server"
+
       # No stored secret for storage: this identity is granted blob access to
       # the `landing` container by its role assignment.
       - name: Azure login (OIDC, no stored secret)
@@ -41,15 +57,21 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # The storage account firewall denies by default; GitHub-hosted runners
-      # have random egress IPs, so allow this run's IP and remove it afterwards.
-      - name: Allow runner IP through storage firewall
+      # Both the storage account and the SQL server deny by default; GitHub-hosted
+      # runners have random egress IPs, so allow this run's IP on both and remove
+      # both afterwards.
+      - name: Allow runner IP through storage and SQL firewalls
         id: fw
         run: |
           set -euo pipefail
           IP=$(curl -fsS https://api.ipify.org)
           echo "runner_ip=$IP" >> "$GITHUB_OUTPUT"
           echo "runner egress IP: $IP"
+
+          # The rule name is derived from the IP so the cleanup step can always
+          # find it, even when creation only half succeeded.
+          SQL_RULE="github-actions-$IP"
+          echo "sql_rule=$SQL_RULE" >> "$GITHUB_OUTPUT"
 
           # Propagation of a network rule is eventually consistent and the
           # control-plane call itself occasionally 5xxs; retry both.
@@ -85,6 +107,31 @@ jobs:
             sleep 10
           done
 
+          # Same for the SQL server. Errors such as "rule already exists" are
+          # harmless: the verification below is what decides.
+          for attempt in 1 2 3 4 5; do
+            az sql server firewall-rule create \
+              --resource-group "$STORAGE_RG" \
+              --server "$SQL_SERVER" \
+              --name "$SQL_RULE" \
+              --start-ip-address "$IP" \
+              --end-ip-address "$IP" -o none 2>/dev/null || true
+            if az sql server firewall-rule show \
+                 --resource-group "$STORAGE_RG" \
+                 --server "$SQL_SERVER" \
+                 --name "$SQL_RULE" \
+                 --query "startIpAddress" -o tsv 2>/dev/null | tr -d '\r' | grep -qx "$IP"; then
+              echo "SQL firewall rule for $IP is present"
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "SQL firewall rule for $IP never appeared" >&2
+              exit 1
+            fi
+            echo "SQL firewall rule not visible yet (attempt $attempt/5)"
+            sleep 10
+          done
+
           # Rule present is not the same as reachable: wait for it to take effect.
           for i in $(seq 1 30); do
             if az storage container show --name landing \
@@ -103,20 +150,74 @@ jobs:
           AZURE_STORAGE_ACCOUNT_URL: https://${{ env.STORAGE_ACCOUNT }}.blob.core.windows.net
         run: python ingest.py
 
-      - name: Remove runner IP from storage firewall
+      # Landing -> Azure SQL. Idempotent per (year, gas): a re-run replaces the
+      # year's rows rather than appending.
+      - name: Load warehouse (landing JSON -> Azure SQL)
+        env:
+          AZURE_STORAGE_ACCOUNT_URL: https://${{ env.STORAGE_ACCOUNT }}.blob.core.windows.net
+          AZURE_SQL_SERVER: ${{ env.SQL_SERVER }}.database.windows.net
+          AZURE_SQL_DATABASE: ${{ env.SQL_DATABASE }}
+        run: python warehouse.py load
+
+      # Azure SQL -> Parquet in the `curated` container, because Databricks Free
+      # Edition compute cannot reach SQL over the internet.
+      - name: Export for Databricks (Azure SQL -> Parquet)
+        env:
+          AZURE_STORAGE_ACCOUNT_URL: https://${{ env.STORAGE_ACCOUNT }}.blob.core.windows.net
+          AZURE_SQL_SERVER: ${{ env.SQL_SERVER }}.database.windows.net
+          AZURE_SQL_DATABASE: ${{ env.SQL_DATABASE }}
+        run: python warehouse.py export
+
+      - name: Remove runner IP from storage and SQL firewalls
         if: always() && steps.fw.outputs.runner_ip != ''
         run: |
           set -uo pipefail
+
           for attempt in 1 2 3; do
             if az storage account network-rule remove \
                  --account-name "$STORAGE_ACCOUNT" \
                  --resource-group "$STORAGE_RG" \
                  --ip-address "${{ steps.fw.outputs.runner_ip }}" \
-                 -o none --only-show-errors; then
-              echo "firewall rule removed"
-              exit 0
+                 -o none --only-show-errors 2>/dev/null; then
+              echo "storage firewall rule removed"
+              break
             fi
             echo "network-rule remove failed (attempt $attempt/3), retrying in 10s"
             sleep 10
           done
-          echo "::warning::could not remove firewall rule for ${{ steps.fw.outputs.runner_ip }}"
+
+          # A rule that was never created is already in the desired state, so
+          # check for it instead of treating the delete error as a failure.
+          if az sql server firewall-rule show \
+               --resource-group "$STORAGE_RG" \
+               --server "$SQL_SERVER" \
+               --name "${{ steps.fw.outputs.sql_rule }}" -o none 2>/dev/null; then
+            for attempt in 1 2 3; do
+              if az sql server firewall-rule delete \
+                   --resource-group "$STORAGE_RG" \
+                   --server "$SQL_SERVER" \
+                   --name "${{ steps.fw.outputs.sql_rule }}" \
+                   -o none --only-show-errors; then
+                echo "SQL firewall rule removed"
+                break
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "::warning::could not remove SQL firewall rule '${{ steps.fw.outputs.sql_rule }}'"
+                break
+              fi
+              echo "SQL rule delete failed (attempt $attempt/3), retrying in 10s"
+              sleep 10
+            done
+          else
+            echo "no SQL firewall rule to remove"
+          fi
+
+          # Leftover rules are reported, not fatal - the data path already
+          # finished by this point and a red run here would be misleading.
+          if az storage account show \
+               --account-name "$STORAGE_ACCOUNT" \
+               --resource-group "$STORAGE_RG" \
+               --query "networkRuleSet.ipRules[].ipAddressOrRange" -o tsv \
+               | tr -d '\r' | grep -qx "${{ steps.fw.outputs.runner_ip }}"; then
+            echo "::warning::storage firewall still allows ${{ steps.fw.outputs.runner_ip }}; prune it by hand"
+          fi
