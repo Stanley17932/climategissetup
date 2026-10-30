@@ -61,8 +61,10 @@ random egress IPs, so each run:
 5. removes the rule — always, even if the job failed.
 
 If the cleanup ever fails, the run emits a warning with the leftover IP so it can
-be pruned by hand. The account currently has several long-lived IP rules from
-earlier manual runs.
+be pruned by hand. In practice every run has cleaned up after itself, including
+the one that failed mid-way. The account keeps `defaultAction: Deny`, one VNet
+rule for the dev subnet, and a single allow rule for the developer's current IP —
+old manual rules were pruned.
 
 ## Guards
 
