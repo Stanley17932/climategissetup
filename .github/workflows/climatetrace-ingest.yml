@@ -39,13 +39,20 @@ jobs:
       - name: Install ODBC Driver 18 for SQL Server
         run: |
           set -euo pipefail
+          if odbcinst -q -d -n "ODBC Driver 18 for SQL Server" >/dev/null 2>&1; then
+            echo "ODBC Driver 18 already installed"
+            exit 0
+          fi
+
           OS_VER=$(. /etc/os-release && echo "$VERSION_ID")
+          # --batch is required: there is no TTY, and gpg otherwise fails trying
+          # to open /dev/tty while importing the signing key.
           curl -sSL https://packages.microsoft.com/keys/microsoft.asc \
-            | sudo gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
+            | sudo gpg --batch --yes --dearmor -o /usr/share/keyrings/microsoft-prod.gpg
           curl -sSL "https://packages.microsoft.com/config/ubuntu/${OS_VER}/prod.list" \
             | sudo tee /etc/apt/sources.list.d/mssql-release.list >/dev/null
           sudo apt-get update -qq
-          sudo ACCEPT_EULA=Y apt-get install -y -qq msodbcsql18
+          sudo ACCEPT_EULA=Y apt-get install -y -qq msodbcsql18 unixodbc
           odbcinst -q -d -n "ODBC Driver 18 for SQL Server"
 
       # No stored secret for storage: this identity is granted blob access to
