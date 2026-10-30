@@ -32,6 +32,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # No stored secret for storage: this identity is granted blob access to
+      # the `landing` container by its role assignment.
       - name: Azure login (OIDC, no stored secret)
         uses: azure/login@v2
         with:
@@ -43,36 +45,78 @@ jobs:
       # have random egress IPs, so allow this run's IP and remove it afterwards.
       - name: Allow runner IP through storage firewall
         id: fw
-        env:
-          CONN: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
         run: |
           set -euo pipefail
           IP=$(curl -fsS https://api.ipify.org)
           echo "runner_ip=$IP" >> "$GITHUB_OUTPUT"
-          az storage account network-rule add \
-            --account-name "$STORAGE_ACCOUNT" \
-            --resource-group "$STORAGE_RG" \
-            --ip-address "$IP" -o none
-          for i in $(seq 1 18); do
+          echo "runner egress IP: $IP"
+
+          # Propagation of a network rule is eventually consistent and the
+          # control-plane call itself occasionally 5xxs; retry both.
+          for attempt in 1 2 3 4 5; do
+            if az storage account network-rule add \
+                 --account-name "$STORAGE_ACCOUNT" \
+                 --resource-group "$STORAGE_RG" \
+                 --ip-address "$IP" -o none 2>/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "could not add firewall rule after 5 attempts" >&2
+              exit 1
+            fi
+            echo "network-rule add failed (attempt $attempt/5), retrying in 15s"
+            sleep 15
+          done
+
+          # Confirm the rule actually landed instead of trusting the exit code.
+          for attempt in 1 2 3 4 5; do
+            if az storage account show \
+                 --account-name "$STORAGE_ACCOUNT" \
+                 --resource-group "$STORAGE_RG" \
+                 --query "networkRuleSet.ipRules[].ipAddressOrRange" -o tsv \
+                 | tr -d '\r' | grep -qx "$IP"; then
+              echo "firewall rule for $IP is present"
+              break
+            fi
+            if [ "$attempt" -eq 5 ]; then
+              echo "firewall rule for $IP never appeared" >&2
+              exit 1
+            fi
+            sleep 10
+          done
+
+          # Rule present is not the same as reachable: wait for it to take effect.
+          for i in $(seq 1 30); do
             if az storage container show --name landing \
-                 --connection-string "$CONN" -o none 2>/dev/null; then
+                 --account-name "$STORAGE_ACCOUNT" \
+                 --auth-mode login -o none 2>/dev/null; then
               echo "storage reachable after $((i * 10))s"
               exit 0
             fi
             sleep 10
           done
-          echo "storage still unreachable after 180s" >&2
+          echo "storage still unreachable after 300s" >&2
           exit 1
 
       - name: Run ingestion
         env:
-          AZURE_STORAGE_CONNECTION_STRING: ${{ secrets.AZURE_STORAGE_CONNECTION_STRING }}
+          AZURE_STORAGE_ACCOUNT_URL: https://${{ env.STORAGE_ACCOUNT }}.blob.core.windows.net
         run: python ingest.py
 
       - name: Remove runner IP from storage firewall
         if: always() && steps.fw.outputs.runner_ip != ''
         run: |
-          az storage account network-rule remove \
-            --account-name "$STORAGE_ACCOUNT" \
-            --resource-group "$STORAGE_RG" \
-            --ip-address "${{ steps.fw.outputs.runner_ip }}" -o none
+          set -uo pipefail
+          for attempt in 1 2 3; do
+            if az storage account network-rule remove \
+                 --account-name "$STORAGE_ACCOUNT" \
+                 --resource-group "$STORAGE_RG" \
+                 --ip-address "${{ steps.fw.outputs.runner_ip }}" \
+                 -o none --only-show-errors; then
+              echo "firewall rule removed"
+              exit 0
+            fi
+            echo "network-rule remove failed (attempt $attempt/3), retrying in 10s"
+            sleep 10
+          done
+          echo "::warning::could not remove firewall rule for ${{ steps.fw.outputs.runner_ip }}"
