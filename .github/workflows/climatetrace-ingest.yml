@@ -98,9 +98,11 @@ jobs:
           done
 
           # Confirm the rule actually landed instead of trusting the exit code.
+          # `-n` here, not `--account-name`: the management-plane command dropped
+          # the longer alias in Azure CLI 2.91 and rejects it.
           for attempt in 1 2 3 4 5; do
             if az storage account show \
-                 --account-name "$STORAGE_ACCOUNT" \
+                 -n "$STORAGE_ACCOUNT" \
                  --resource-group "$STORAGE_RG" \
                  --query "networkRuleSet.ipRules[].ipAddressOrRange" -o tsv \
                  | tr -d '\r' | grep -qx "$IP"; then
@@ -222,7 +224,7 @@ jobs:
           # Leftover rules are reported, not fatal - the data path already
           # finished by this point and a red run here would be misleading.
           if az storage account show \
-               --account-name "$STORAGE_ACCOUNT" \
+               -n "$STORAGE_ACCOUNT" \
                --resource-group "$STORAGE_RG" \
                --query "networkRuleSet.ipRules[].ipAddressOrRange" -o tsv \
                | tr -d '\r' | grep -qx "${{ steps.fw.outputs.runner_ip }}"; then
