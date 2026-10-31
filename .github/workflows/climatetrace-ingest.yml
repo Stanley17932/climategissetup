@@ -169,13 +169,28 @@ jobs:
         run: python warehouse.py load
 
       # Azure SQL -> Parquet in the `curated` container, because Databricks Free
-      # Edition compute cannot reach SQL over the internet.
+      # Edition compute cannot reach SQL over the internet. `--out` also stages
+      # the same bytes locally for the push step below.
       - name: Export for Databricks (Azure SQL -> Parquet)
         env:
           AZURE_STORAGE_ACCOUNT_URL: https://${{ env.STORAGE_ACCOUNT }}.blob.core.windows.net
           AZURE_SQL_SERVER: ${{ env.SQL_SERVER }}.database.windows.net
           AZURE_SQL_DATABASE: ${{ env.SQL_DATABASE }}
-        run: python warehouse.py export
+        run: python warehouse.py export --out=dist
+
+      # The reverse direction: Free Edition cannot read the firewalled storage
+      # account (no trusted-domain entry, no private networking), so the
+      # snapshot is pushed into a Unity Catalog volume and the table is rebuilt
+      # there. Skipped until the DATABRICKS_* secrets exist, so the Azure half
+      # keeps running without a workspace.
+      - name: Push to Databricks (Parquet -> Unity Catalog)
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_VOLUME: ${{ vars.DATABRICKS_VOLUME }}
+          DATABRICKS_TABLE: ${{ vars.DATABRICKS_TABLE }}
+        if: env.DATABRICKS_HOST != ''
+        run: python databricks_push.py --from=dist
 
       - name: Remove runner IP from storage and SQL firewalls
         if: always() && steps.fw.outputs.runner_ip != ''

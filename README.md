@@ -145,6 +145,53 @@ The SQL server firewall denies by default too, so the workflow adds a
 `github-actions-<ip>` rule alongside the storage rule and removes it afterwards.
 Locally, your own IP needs a rule on both (and on the storage account).
 
+## Databricks (curated -> Unity Catalog)
+
+The Parquet in `curated` is the system of record, but **Databricks Free Edition
+cannot read it**. Its compute is serverless-only, outbound internet is restricted
+to a set of trusted domains, and Free Edition has no private networking — so
+there is no egress address to allow, no external location that would work, and a
+SAS token does not bypass network rules anyway.
+
+The flow therefore runs in the other direction: the runner pushes the bytes into
+the workspace.
+
+```
+warehouse.py export --out=dist   # writes curated + stages the files locally
+databricks_push.py --from=dist   # PUT /api/2.0/fs/files -> UC volume,
+                                 # then CREATE OR REPLACE the table over SQL
+```
+
+| object | name | why |
+|---|---|---|
+| volume | `main.climatetrace.raw` | holds `climatetrace_sources/year=<year>/sources.parquet` |
+| table | `main.climatetrace.sources` | rebuilt from the volume on every run |
+
+`export` writes a full snapshot per year, so the table is replaced rather than
+merged. Both years together are ~2 MB, so the whole snapshot travels each run and
+there is no state to reconcile.
+
+### One-time workspace setup
+
+1. Sign up for Free Edition at <https://www.databricks.com/signup/free-edition> —
+   personal email, no Azure subscription involved.
+2. Copy the workspace URL from the browser:
+   `https://dbc-xxxxxxxx-xxxx.cloud.databricks.com`.
+3. **Settings → Developer → Access tokens → Generate new token**, scoped to
+   `files`, `unity-catalog` and `sql`. Do not use `all-apis`.
+4. Create the schema and volume once:
+   `python databricks_push.py --bootstrap`
+5. Add `DATABRICKS_HOST` and `DATABRICKS_TOKEN` as repository secrets. The
+   workflow step is skipped while they are absent, so the Azure half keeps
+   running regardless.
+
+Repository variables `DATABRICKS_VOLUME` and `DATABRICKS_TABLE` override the
+defaults above.
+
+> A Free Edition token belongs to your user — the workspace has no account
+> console to create a service principal — so treat it as a personal credential,
+> scope it, and set an expiry. Databricks revokes PATs unused for 90 days.
+
 ## Running locally
 
 ```bash
@@ -181,6 +228,7 @@ data = ingest.fetch_climatetrace(ingest.SOURCES[0], 2025)
 ```
 ingest.py                                  # pull -> landing blobs
 warehouse.py                               # landing -> Azure SQL -> curated Parquet
+databricks_push.py                         # curated snapshot -> UC volume + table
 requirements.txt
 .github/workflows/climatetrace-ingest.yml  # schedule + OIDC + firewall handling
 ```
