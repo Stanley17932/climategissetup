@@ -20,7 +20,7 @@ import sys
 import time
 
 import pyodbc
-from azure.core.exceptions import ResourceExistsError
+from azure.core.exceptions import HttpResponseError, ResourceExistsError
 from azure.identity import DefaultAzureCredential
 from azure.storage.blob import BlobServiceClient
 from dotenv import load_dotenv
@@ -320,6 +320,12 @@ def export(conn, blob_service, out_dir=None):
         container.create_container()
     except ResourceExistsError:
         pass
+    except HttpResponseError as exc:
+        # Creating a container is an account-level operation, so the CI identity -
+        # which is scoped to this one container - is refused. That is fine as long
+        # as the container exists; the upload below is the real permission test.
+        if getattr(exc, "status_code", None) != 403:
+            raise
 
     written = []
     for year in sorted({r["year"] for r in rows}):
