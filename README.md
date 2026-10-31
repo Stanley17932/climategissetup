@@ -43,12 +43,14 @@ landing/climatetrace/<label>/year=<year>/dt=<YYYY-MM-DD>/sources.json
 The job has **no stored storage credential**:
 
 1. `azure/login` with GitHub OIDC → the `climatetrace-ingest-gh` service principal.
-2. The principal holds two narrowly scoped roles on `databrickssetup`:
+2. The principal holds four narrowly scoped roles:
 
 | role | scope | allows |
 |---|---|---|
 | `Climate TRACE storage firewall updater` (custom) | storage account | read/write account, `network-rule` changes. Explicitly **no** `listKeys`, `regenerateKey`, or delete. |
 | `Climate TRACE landing writer` (custom) | `landing` container | blob read, write, add. **No** delete, no key access. |
+| `Climate TRACE curated writer` (custom) | `curated` container | blob read, write, add for the export. **No** delete, no key access, cannot touch `landing`. |
+| `Climate TRACE SQL firewall updater` (custom) | SQL server | read the server, add/remove firewall rules. **No** data-plane or delete rights. |
 
 `ingest.py` authenticates with `DefaultAzureCredential` against
 `AZURE_STORAGE_ACCOUNT_URL`.
@@ -59,16 +61,21 @@ The storage account denies network access by default. GitHub-hosted runners have
 random egress IPs, so each run:
 
 1. finds its own egress IP,
-2. adds a temporary `Allow` rule (retried, then verified to have landed),
+2. adds a temporary `Allow` rule on **both** the storage account and the SQL
+   server (each retried, then verified to have landed),
 3. waits until the storage API is actually reachable,
-4. runs the ingest,
-5. removes the rule — always, even if the job failed.
+4. runs the ingest, the load and the export,
+5. removes both rules — always, even if the job failed.
 
 If the cleanup ever fails, the run emits a warning with the leftover IP so it can
 be pruned by hand. In practice every run has cleaned up after itself, including
-the one that failed mid-way. The account keeps `defaultAction: Deny`, one VNet
+the ones that failed mid-way. The account keeps `defaultAction: Deny`, one VNet
 rule for the dev subnet, and a single allow rule for the developer's current IP —
 old manual rules were pruned.
+
+> Note for anyone editing this workflow: `az storage account show` takes `-n`, not
+> `--account-name` (dropped in Azure CLI 2.91), while `az storage container show`
+> still wants `--account-name`. Mixing them up fails the run before any data moves.
 
 ## Guards
 
