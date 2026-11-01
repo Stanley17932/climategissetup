@@ -164,8 +164,8 @@ databricks_push.py --from=dist   # PUT /api/2.0/fs/files -> UC volume,
 
 | object | name | why |
 |---|---|---|
-| volume | `main.climatetrace.raw` | holds `climatetrace_sources/year=<year>/sources.parquet` |
-| table | `main.climatetrace.sources` | rebuilt from the volume on every run |
+| volume | `workspace.climatetrace.raw` | holds `climatetrace_sources/year=<year>/sources.parquet` |
+| table | `workspace.climatetrace.sources` | rebuilt from the volume on every run |
 
 `export` writes a full snapshot per year, so the table is replaced rather than
 merged. Both years together are ~2 MB, so the whole snapshot travels each run and
@@ -177,13 +177,18 @@ there is no state to reconcile.
    personal email, no Azure subscription involved.
 2. Copy the workspace URL from the browser:
    `https://dbc-xxxxxxxx-xxxx.cloud.databricks.com`.
-3. **Settings → Developer → Access tokens → Generate new token**, scoped to
-   `files`, `unity-catalog` and `sql`. Do not use `all-apis`.
+3. **Settings → Developer → Access tokens → Generate new token**. If the dialog
+   offers scopes, pick `files`, `unity-catalog` and `sql`; otherwise a plain PAT
+   is fine and can be narrowed later.
 4. Create the schema and volume once:
    `python databricks_push.py --bootstrap`
 5. Add `DATABRICKS_HOST` and `DATABRICKS_TOKEN` as repository secrets. The
    workflow step is skipped while they are absent, so the Azure half keeps
    running regardless.
+
+Free Edition provisions the managed catalogs `workspace` and `dbacademy` and has
+no `main`, which is why the defaults target `workspace`. Any catalog you own can
+be used through the variables below.
 
 Repository variables `DATABRICKS_VOLUME` and `DATABRICKS_TABLE` override the
 defaults above.

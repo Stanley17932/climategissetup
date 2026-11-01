@@ -13,8 +13,11 @@ no inbound access at all.
 Environment:
     DATABRICKS_HOST   https://dbc-xxxxxxxx-xxxx.cloud.databricks.com
     DATABRICKS_TOKEN  PAT scoped to files, unity-catalog and sql
-    DATABRICKS_VOLUME catalog.schema.volume   (default main.climatetrace.raw)
-    DATABRICKS_TABLE  catalog.schema.table    (default main.climatetrace.sources)
+    DATABRICKS_VOLUME catalog.schema.volume   (default workspace.climatetrace.raw)
+    DATABRICKS_TABLE  catalog.schema.table    (default workspace.climatetrace.sources)
+
+Free Edition ships `workspace` and `dbacademy` as managed catalogs and has no
+`main`, so the defaults live in `workspace`.
 """
 
 import os
@@ -23,8 +26,8 @@ import time
 
 import requests
 
-DEFAULT_VOLUME = "main.climatetrace.raw"
-DEFAULT_TABLE = "main.climatetrace.sources"
+DEFAULT_VOLUME = "workspace.climatetrace.raw"
+DEFAULT_TABLE = "workspace.climatetrace.sources"
 REMOTE_DIR = "climatetrace_sources"
 TIMEOUT = 60
 
