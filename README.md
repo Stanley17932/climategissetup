@@ -197,6 +197,26 @@ defaults above.
 > console to create a service principal — so treat it as a personal credential,
 > scope it, and set an expiry. Databricks revokes PATs unused for 90 days.
 
+### Dashboard
+
+`databricks_dashboard.py` builds the AI/BI dashboard over the same table, so it
+is reproducible rather than click-ops:
+
+```bash
+python databricks_dashboard.py              # create or update, then publish
+python databricks_dashboard.py --no-publish # draft only
+```
+
+It is idempotent — the dashboard is matched by display name, so re-running
+updates it in place. Tiles: four counters, emissions by sector and year, top ten
+countries, and the top fifteen facilities, all reading
+`workspace.climatetrace.sources`.
+
+The table is deliberately a **single snapshot**, replaced on every run, with
+`partition_dt` kept as an audit column. Nothing reads history yet; the current
+year from the API is year-to-date, so the dashboard labels it YTD and ranks on
+the last complete year instead.
+
 ## Running locally
 
 ```bash
