@@ -2,7 +2,11 @@ name: Climate TRACE daily ingest
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # daily 06:00 UTC
+    # Asked for 00:23 UTC, not 06:00: GitHub queues scheduled runs and this repo
+    # sees a median +5.7h delay, so 06:00 would land late afternoon EAT. The
+    # minute is not 0 because the scheduler is busiest on the hour. See the
+    # Schedule section of the README before changing this.
+    - cron: '23 0 * * *'
   workflow_dispatch: {}
 
 permissions:

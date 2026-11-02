@@ -217,6 +217,40 @@ The table is deliberately a **single snapshot**, replaced on every run, with
 year from the API is year-to-date, so the dashboard labels it YTD and ranks on
 the last complete year instead.
 
+## Schedule
+
+GitHub does not run scheduled workflows at the time you ask for. It queues them,
+and on this repo the queue adds hours. Measured over every scheduled run to date
+(2026-10-22 to 2026-11-01, 11 runs):
+
+| slot | actual start (UTC) | delay |
+|---|---|---|
+| 10-22 | 11:08 | +5.14h |
+| 10-24 | 10:16 | +4.27h |
+| 10-26 | 12:14 | +6.23h |
+| 10-28 | 12:05 | +6.09h |
+| 10-30 | 12:06 | +6.11h |
+| 11-01 | 12:39 | +6.66h |
+
+Median **+5.7h**, range +4.3h to +6.7h, and drifting later over the fortnight.
+That is queueing, not a malformed cron — there is only one workflow in the repo,
+so nothing is competing with it on the concurrency group.
+
+Because of that, the cron sits at `23 0 * * *` rather than the `06:00 UTC`
+(09:00 EAT) it is meant to approximate. With the delay above, the run actually
+lands between **04:20 and 06:40 UTC** — morning data rather than mid-afternoon.
+The minute is deliberately not `0`: the scheduler is busiest at the top of the
+hour, and off-hour slots queue less.
+
+This is a correction for measured queueing, not a guarantee. To re-measure, list
+the scheduled runs (Actions → filter by `schedule`, or the runs API with
+`event=schedule`) and compare `created_at` to the slot:
+
+`created_at - 00:23 UTC` ≈ the current delay. If it drifts again, move the slot
+by the new median. If a hard 06:00 UTC is ever required, the only reliable route
+is an external trigger (cron-job.org and friends) calling `workflow_dispatch` —
+cron in Actions is best-effort by design.
+
 ## Running locally
 
 ```bash
