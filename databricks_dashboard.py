@@ -12,14 +12,21 @@ Environment:
     DATABRICKS_TOKEN  PAT scoped to files, unity-catalog and sql
     DATABRICKS_TABLE  catalog.schema.table    (default workspace.climatetrace.sources)
 
+Two conventions here are not cosmetic, they are what makes tiles render:
+
+* Every dataset query line is given a trailing newline except the last. The API
+  joins `queryLines` without inserting whitespace, so anything else welds tokens
+  together (`SELECTCOUNT(*)`).
+* Tables use spec version 1 with fully described columns. Version 3 with bare
+  `{fieldName}` entries publishes without error and then renders nothing.
+
 One caveat is baked into the labels: the current year is pulled from the
 Climate TRACE API as it stands, which is year-to-date. In the 2026 snapshot its
 activity is about two-thirds of 2025, so it is shown as YTD and never as a
-like-for-like drop. The counters and rankings read the last complete year.
+like-for-like drop. Counters and rankings read the last complete year.
 """
 
 import json
-import os
 import sys
 
 import databricks_push as push
@@ -29,9 +36,9 @@ LAST_COMPLETE = "(SELECT MAX(year) FROM {table}) - 1"
 
 
 def sql_lines(text):
-    """The API wants the query as a list of lines, newlines included."""
-    stripped = [line for line in text.strip("\n").split("\n")]
-    return [line if i == len(stripped) - 1 else line + "\n" for i, line in enumerate(stripped)]
+    """The API joins queryLines without whitespace; each line keeps its own."""
+    lines = text.strip("\n").split("\n")
+    return [line if i == len(lines) - 1 else line + "\n" for i, line in enumerate(lines)]
 
 
 def dataset(name, display, sql):
@@ -68,6 +75,18 @@ ORDER BY sector, year
 """,
         ),
         dataset(
+            "sector_share",
+            "sector share, last complete year",
+            f"""
+SELECT sector AS `Sector`,
+       CAST(ROUND(SUM(emissions_quantity) / 1e6, 0) AS DECIMAL(18,0)) AS `Mt CO2`
+FROM {table}
+WHERE year = {last}
+GROUP BY sector
+ORDER BY `Mt CO2` DESC
+""",
+        ),
+        dataset(
             "top_countries",
             "top countries, last complete year",
             f"""
@@ -78,6 +97,47 @@ WHERE year = {last}
 GROUP BY country
 ORDER BY `Mt CO2` DESC
 LIMIT 10
+""",
+        ),
+        dataset(
+            "intensity",
+            "power intensity, last complete year",
+            f"""
+SELECT country AS `Country`,
+       CAST(ROUND(SUM(emissions_quantity) * 1000.0 / NULLIF(SUM(activity), 0), 0) AS DECIMAL(10,0)) AS `kg CO2 per MWh`,
+       CAST(ROUND(SUM(emissions_quantity) / 1e6, 0) AS DECIMAL(18,0)) AS `Mt CO2`
+FROM {table}
+WHERE year = {last} AND sector = 'power' AND activity > 0
+GROUP BY country
+ORDER BY `Mt CO2` DESC
+LIMIT 10
+""",
+        ),
+        dataset(
+            "trend",
+            "emissions by year and sector",
+            f"""
+SELECT TO_DATE(CONCAT(year, '-01-01')) AS `Year`,
+       sector AS `Sector`,
+       CAST(ROUND(SUM(emissions_quantity) / 1e6, 0) AS DECIMAL(18,0)) AS `Mt CO2`
+FROM {table}
+GROUP BY 1, 2
+ORDER BY 1, 2
+""",
+        ),
+        dataset(
+            "power_scatter",
+            "largest power assets, last complete year",
+            f"""
+SELECT name AS `Facility`,
+       country AS `Country`,
+       ROUND(capacity, 0) AS `Capacity (MW)`,
+       ROUND(emissions_quantity / 1e6, 2) AS `Mt CO2`,
+       CASE WHEN country IN ('CHN', 'USA', 'IND', 'RUS', 'JPN') THEN country ELSE 'Other' END AS `Group`
+FROM {table}
+WHERE year = {last} AND sector = 'power' AND capacity > 0 AND emissions_quantity > 0
+ORDER BY emissions_quantity DESC
+LIMIT 500
 """,
         ),
         dataset(
@@ -108,7 +168,7 @@ def textbox(name, markdown, x, y, width, height):
     }
 
 
-def counter(name, title, field, dataset_name="summary", places=0):
+def counter(name, title, field, x, y, width, height, places=0):
     return {
         "widget": {
             "name": name,
@@ -116,7 +176,7 @@ def counter(name, title, field, dataset_name="summary", places=0):
                 {
                     "name": "main_query",
                     "query": {
-                        "datasetName": dataset_name,
+                        "datasetName": "summary",
                         "fields": [{"name": field, "expression": f"`{field}`"}],
                         "disaggregated": True,
                     },
@@ -140,21 +200,11 @@ def counter(name, title, field, dataset_name="summary", places=0):
                 "data": {"queryName": "main_query"},
             },
         },
-        "position": None,
+        "position": {"x": x, "y": y, "width": width, "height": height},
     }
 
 
-def bar(name, title, dataset_name, fields, x_field, y_field, color_field=None):
-    encodings = {
-        "x": {"fieldName": x_field, "scale": {"type": "categorical"}, "displayName": x_field},
-        "y": {"fieldName": y_field, "scale": {"type": "quantitative"}, "displayName": y_field},
-    }
-    if color_field:
-        encodings["color"] = {
-            "fieldName": color_field,
-            "scale": {"type": "categorical"},
-            "displayName": color_field,
-        }
+def chart(name, title, kind, dataset_name, encodings, fields, x, y, width, height, disagg=True):
     return {
         "widget": {
             "name": name,
@@ -164,18 +214,46 @@ def bar(name, title, dataset_name, fields, x_field, y_field, color_field=None):
                     "query": {
                         "datasetName": dataset_name,
                         "fields": [{"name": f, "expression": f"`{f}`"} for f in fields],
-                        "disaggregated": True,
+                        "disaggregated": disagg,
                     },
                 }
             ],
             "spec": {
                 "version": 3,
                 "frame": {"title": title, "showTitle": True, "showDescription": False},
-                "widgetType": "bar",
+                "widgetType": kind,
                 "encodings": encodings,
             },
         },
-        "position": None,
+        "position": {"x": x, "y": y, "width": width, "height": height},
+    }
+
+
+def column(field, kind="string", order=0, number_format=None):
+    return {
+        "fieldName": field,
+        "displayName": field,
+        "title": field,
+        "type": kind,
+        "displayAs": "number" if kind in ("number", "integer") else kind,
+        "visible": True,
+        "order": order,
+        "allowSearch": kind == "string",
+        "alignContent": "right" if kind in ("number", "integer") else "left",
+        "linkUrlTemplate": "{{ @ }}",
+        "linkTextTemplate": "{{ @ }}",
+        "linkTitleTemplate": "{{ @ }}",
+        "linkOpenInNewTab": True,
+        "highlightLinks": False,
+        "allowHTML": False,
+        "useMonospaceFont": False,
+        "preserveWhitespace": False,
+        "imageUrlTemplate": "{{ @ }}",
+        "imageTitleTemplate": "{{ @ }}",
+        "imageWidth": "",
+        "imageHeight": "",
+        "booleanValues": ["false", "true"],
+        **({"numberFormat": number_format} if number_format else {}),
     }
 
 
@@ -194,89 +272,118 @@ def table_widget(name, title, dataset_name, columns, x, y, width, height):
                 }
             ],
             "spec": {
-                "version": 3,
-                "frame": {"title": title, "showTitle": True, "showDescription": False},
+                "version": 1,
                 "widgetType": "table",
-                "encodings": {"columns": [{"fieldName": c, "displayName": c} for c in columns]},
+                "allowHTMLByDefault": False,
+                "condensed": True,
+                "withRowNumber": False,
+                "itemsPerPage": 15,
+                "paginationSize": "default",
+                "invisibleColumns": [],
+                "frame": {"title": title, "showTitle": True, "showDescription": False},
+                "encodings": {
+                    "columns": [
+                        column("Facility"),
+                        column("Country"),
+                        column("Sector"),
+                        column("Source"),
+                        column("Mt CO2", kind="number", order=4, number_format="0.00"),
+                    ]
+                },
             },
         },
         "position": {"x": x, "y": y, "width": width, "height": height},
     }
 
 
-def place(item, x, y, width, height):
-    item["position"] = {"x": x, "y": y, "width": width, "height": height}
-    return item
-
-
 def page():
-    layout = [
-        textbox(
-            "title",
-            "# Climate TRACE - facility emissions\n"
-            "Facilities, countries and sectors as the pipeline last loaded them.",
-            0, 0, 12, 2,
-        ),
-        place(counter("c_assets", "Assets tracked", "Assets"), 0, 2, 3, 2),
-        place(counter("c_countries", "Countries", "Countries"), 3, 2, 3, 2),
-        place(counter("c_sectors", "Sectors", "Sectors"), 6, 2, 3, 2),
-        place(
-            counter("c_gt", "Gt CO2 (last complete year)", "Gt CO2 (last complete year)", places=2),
-            9, 2, 3, 2,
-        ),
-        place(
-            bar(
-                "b_sector",
-                "Emissions by sector - current year is YTD",
-                "sector_year",
-                ["Sector", "Year", "Mt CO2"],
-                "Sector",
-                "Mt CO2",
-                color_field="Year",
-            ),
-            0, 4, 6, 6,
-        ),
-        place(
-            bar(
-                "b_countries",
-                "Top 10 countries - last complete year",
-                "top_countries",
-                ["Country", "Mt CO2"],
-                "Country",
-                "Mt CO2",
-            ),
-            6, 4, 6, 6,
-        ),
-        table_widget(
-            "t_assets",
-            "Top 15 emitting facilities - last complete year",
-            "top_assets",
-            ["Facility", "Country", "Sector", "Source", "Mt CO2"],
-            0, 10, 12, 8,
-        ),
-        textbox(
-            "note",
-            "**Reading the current year.** The API returns the current year "
-            "year-to-date: activity in the latest snapshot is roughly two-thirds of "
-            "the complete year, so treat that series as partial rather than a fall in "
-            "emissions. Rankings and the Gt counter use the last complete year.",
-            0, 18, 12, 2,
-        ),
-    ]
     return {
         "name": "page_overview",
         "displayName": "Overview",
         "pageType": "PAGE_TYPE_CANVAS",
         "layoutVersion": "GRID_V1",
-        "layout": layout,
+        "layout": [
+            textbox(
+                "title",
+                "# Climate TRACE - facility emissions\n"
+                "Facilities, countries and sectors as the pipeline last loaded them.",
+                0, 0, 12, 2,
+            ),
+            counter("c_assets", "Assets tracked", "Assets", 0, 2, 3, 2),
+            counter("c_countries", "Countries", "Countries", 3, 2, 3, 2),
+            counter("c_sectors", "Sectors", "Sectors", 6, 2, 3, 2),
+            counter("c_gt", "Gt CO2 (last complete year)", "Gt CO2 (last complete year)", 9, 2, 3, 2, places=2),
+            chart(
+                "b_sector", "Emissions by sector - current year is YTD", "bar", "sector_year",
+                {
+                    "x": {"fieldName": "Sector", "scale": {"type": "categorical"}, "displayName": "Sector"},
+                    "y": {"fieldName": "Mt CO2", "scale": {"type": "quantitative"}, "displayName": "Mt CO2"},
+                    "color": {"fieldName": "Year", "scale": {"type": "categorical"}, "displayName": "Year"},
+                },
+                ["Sector", "Year", "Mt CO2"], 0, 4, 6, 7,
+            ),
+            chart(
+                "d_sector", "Share of emissions - last complete year", "donut", "sector_share",
+                {
+                    "color": {"fieldName": "Sector", "scale": {"type": "categorical"}, "displayName": "Sector"},
+                    "angle": {"fieldName": "Mt CO2", "scale": {"type": "quantitative"}, "displayName": "Mt CO2"},
+                },
+                ["Sector", "Mt CO2"], 6, 4, 6, 7,
+            ),
+            chart(
+                "b_countries", "Top 10 countries - last complete year", "bar", "top_countries",
+                {
+                    "x": {"fieldName": "Mt CO2", "scale": {"type": "quantitative"}, "displayName": "Mt CO2"},
+                    "y": {"fieldName": "Country", "scale": {"type": "categorical"}, "displayName": "Country"},
+                    "label": {"show": True},
+                },
+                ["Country", "Mt CO2"], 0, 11, 6, 7,
+            ),
+            chart(
+                "b_intensity", "Power intensity - kg CO2 per MWh", "bar", "intensity",
+                {
+                    "x": {"fieldName": "kg CO2 per MWh", "scale": {"type": "quantitative"}, "displayName": "kg CO2 per MWh"},
+                    "y": {"fieldName": "Country", "scale": {"type": "categorical"}, "displayName": "Country"},
+                    "label": {"show": True},
+                },
+                ["Country", "kg CO2 per MWh", "Mt CO2"], 6, 11, 6, 7,
+            ),
+            chart(
+                "l_trend", "Emissions by year - current year is YTD", "line", "trend",
+                {
+                    "x": {"fieldName": "Year", "scale": {"type": "temporal"}, "displayName": "Year"},
+                    "y": {"fieldName": "Mt CO2", "scale": {"type": "quantitative"}, "displayName": "Mt CO2"},
+                    "color": {"fieldName": "Sector", "scale": {"type": "categorical"}, "displayName": "Sector"},
+                },
+                ["Year", "Sector", "Mt CO2"], 0, 18, 6, 7,
+            ),
+            chart(
+                "s_power", "Largest 500 power assets - capacity vs emissions", "scatter", "power_scatter",
+                {
+                    "x": {"fieldName": "Capacity (MW)", "scale": {"type": "quantitative"}, "displayName": "Capacity (MW)"},
+                    "y": {"fieldName": "Mt CO2", "scale": {"type": "quantitative"}, "displayName": "Mt CO2"},
+                    "color": {"fieldName": "Group", "scale": {"type": "categorical"}, "displayName": "Group"},
+                },
+                ["Facility", "Country", "Capacity (MW)", "Mt CO2", "Group"], 6, 18, 6, 7,
+            ),
+            table_widget(
+                "t_assets", "Top 15 emitting facilities - last complete year", "top_assets",
+                ["Facility", "Country", "Sector", "Source", "Mt CO2"], 0, 25, 12, 9,
+            ),
+            textbox(
+                "note",
+                "**Reading the current year.** The API returns the current year "
+                "year-to-date: activity in the latest snapshot is roughly two-thirds of "
+                "the complete year, so treat that series as partial rather than a fall in "
+                "emissions. Rankings, shares and the Gt counter use the last complete year.",
+                0, 34, 12, 2,
+            ),
+        ],
     }
 
 
 def dashboard_json(table):
-    return {
-        "datasets": datasets(table),
-        "pages": [page()],
-    }
+    return {"datasets": datasets(table), "pages": [page()]}
 
 
 # --- wiring --------------------------------------------------------------

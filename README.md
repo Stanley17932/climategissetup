@@ -208,9 +208,18 @@ python databricks_dashboard.py --no-publish # draft only
 ```
 
 It is idempotent — the dashboard is matched by display name, so re-running
-updates it in place. Tiles: four counters, emissions by sector and year, top ten
-countries, and the top fifteen facilities, all reading
-`workspace.climatetrace.sources`.
+updates it in place. All tiles read `workspace.climatetrace.sources`:
+
+| tile | type | reads |
+|---|---|---|
+| four counters | counter | assets, countries, sectors, Gt CO2 |
+| emissions by sector | bar | both years, current year labelled YTD |
+| share of emissions | donut | sector share, last complete year |
+| top 10 countries | horizontal bar | last complete year |
+| power intensity | horizontal bar | kg CO2 per MWh by country |
+| emissions by year | line | sector trend, current year labelled YTD |
+| 500 largest power assets | scatter | capacity (MW) vs emissions |
+| top 15 facilities | table | last complete year |
 
 The table is deliberately a **single snapshot**, replaced on every run, with
 `partition_dt` kept as an audit column. Nothing reads history yet; the current
